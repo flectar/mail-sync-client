@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/flectar-mail-sync-proto",
+    "crates/flectar-mail-sync-crypto",
+    "crates/flectar-mail-sync-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+repository = "https://github.com/flectar/mail-sync-client"
+
+[workspace.dependencies]
+flectar-mail-sync-proto = { path = "crates/flectar-mail-sync-proto", version = "0.1.0" }
+flectar-mail-sync-crypto = { path = "crates/flectar-mail-sync-crypto", version = "0.1.0" }
+base64 = "0.23"
+bip39 = { version = "3.0", default-features = false, features = ["std"] }
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3.0"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = "0.4"
+hkdf = "0.13"
+hpke = { version = "0.15.1", default-features = false, features = ["alloc", "getrandom", "mlkem", "x25519", "chacha", "hkdfsha2"] }
+hmac = "0.13"
+# The app passes in its own client, with its TLS and trust settings.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+zeroize = { version = "1.9", features = ["derive"] }
+hex = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
