@@ -244,6 +244,20 @@ The existing device computes them from its own group and head and the keys it
 received; the new device from the invite it received and its own keys. They
 differ if a server swapped the keys, the group or the head.
 
+### 4.10 Files
+
+Something too large for a record, such as a scheduled message with its
+attachments, is stored as a file (§6.15). Each file is sealed under a key of
+its own, 32 random bytes that only a record carries:
+
+```
+0x01 || nonce (24) || XChaCha20-Poly1305(file_key, nonce, content, aad = FILE)
+```
+
+The server learns a file's size and when it is fetched, never its key or
+content. A device that refers to a file in a record names its id, sealed
+size and key.
+
 ## 5. Membership chain
 
 ### 5.1 Encoding
@@ -636,6 +650,32 @@ events may arrive in any order. Only subscriptions whose metadata names the
 group count for it. Only the server's own checkouts set that metadata, so
 no other payment counts as one for syncing.
 
+### 6.15 Files
+
+A server may store files (§4.10); `/v1/info` then reports `files` with
+`maxFileBytes`, `maxGroupFileBytes` and `ttlSeconds`. Without it, the server
+stores none and answers these routes with 404.
+
+- `POST /v1/groups/{group}/files` with `{"size": n}`, the sealed file's exact
+  length, makes room for it and answers `{"id": "...", "upload": {"url",
+  "method": "PUT", "expiresAt"}}`. Room counts against the group's file quota
+  at once (507 `quota_exceeded`), larger files are refused (413), and on a
+  server that charges, a group that may not upload gets 402.
+- The device sends the sealed bytes with the method to the URL, which works
+  without a session until `expiresAt`. It may be the server's own
+  (`/v1/file-data/{token}`) or object storage's, such as a presigned S3
+  address.
+- `POST /v1/groups/{group}/files/{id}/complete` confirms the upload once its
+  length matches the announced size (409 otherwise). Unconfirmed room is
+  dropped after an hour.
+- `GET /v1/groups/{group}/files/{id}` answers `{"size": n, "download":
+  {"url", "method": "GET", "expiresAt"}}` for a confirmed file.
+- `DELETE /v1/groups/{group}/files/{id}` removes it. A file also goes
+  `ttlSeconds` after its upload, or when its group is deleted.
+
+Devices check a downloaded file against the size in the record before
+opening it.
+
 ## 7. Device flows (informative)
 
 - **Create a group:**
@@ -741,6 +781,9 @@ the ones clients must respect.
 | Challenge lifetime | 120 s |
 | Session lifetime | 1 h |
 | Tombstone retention | 180 days |
+| Sealed file | 26 MiB |
+| File bytes per group | 512 MiB |
+| File lifetime | 60 days |
 
 ## 10. Security considerations
 
@@ -748,6 +791,7 @@ the ones clients must respect.
   - group and device ids and public keys
   - the membership chain
   - opaque tags
+  - the size of each file, and when it is stored and fetched
   - padded sizes
   - sequence numbers
   - timing

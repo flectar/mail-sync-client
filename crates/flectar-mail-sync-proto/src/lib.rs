@@ -33,6 +33,8 @@ pub mod len {
     pub const CHALLENGE_NONCE: usize = 32;
     /// Challenge identifier.
     pub const CHALLENGE_ID: usize = 16;
+    /// Random file identifier.
+    pub const FILE_ID: usize = 16;
 }
 
 /// Binary data carried as an unpadded base64url string.
@@ -116,6 +118,57 @@ pub struct Info {
     /// Absent on a server that doesn't charge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<Offer>,
+    /// Files too large for a record (SPEC §6.15). Absent on a server that
+    /// doesn't store them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<FilesInfo>,
+}
+
+/// What a server stores for files too large for a record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesInfo {
+    /// Largest accepted sealed file, in bytes.
+    pub max_file_bytes: u64,
+    /// Total bytes of files per group.
+    pub max_group_file_bytes: u64,
+    /// How long a file stays, in seconds, unless deleted first.
+    pub ttl_seconds: u64,
+}
+
+/// `POST /v1/groups/{group}/files`: room for one sealed file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFile {
+    /// The sealed file's exact length in bytes.
+    pub size: u64,
+}
+
+/// Where a file's bytes go or come from: an address that works without a
+/// session until `expires_at` (ms since the Unix epoch).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    pub url: String,
+    /// `PUT` to upload, `GET` to download.
+    pub method: String,
+    pub expires_at: i64,
+}
+
+/// The answer to `POST /v1/groups/{group}/files`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedFile {
+    pub id: Bytes,
+    pub upload: Transfer,
+}
+
+/// The answer to `GET /v1/groups/{group}/files/{id}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLink {
+    pub size: u64,
+    pub download: Transfer,
 }
 
 /// What a server that charges offers new groups.

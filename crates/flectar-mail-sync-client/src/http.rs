@@ -5,9 +5,10 @@ use crate::error::{Error, Result};
 use crate::sse::{Event, SseParser};
 use flectar_mail_sync_proto::{
     AppendOp, Appended, Billing, BillingLink, Bytes, Challenge, ChallengeRequest, Changes,
-    CheckoutRequest, CommitRequest, CommitResponse, Conflict, CreateGroup, CreatePairing,
-    CurrentWrap, ErrorBody, ErrorCode, GroupCreated, Info, OpsPage, PairingCreated,
-    PairingMessages, PairingSlot, PutPairingMessage, Session, SessionRequest,
+    CheckoutRequest, CommitRequest, CommitResponse, Conflict, CreateFile, CreateGroup,
+    CreatePairing, CreatedFile, CurrentWrap, ErrorBody, ErrorCode, FileLink, GroupCreated, Info,
+    OpsPage, PairingCreated, PairingMessages, PairingSlot, PutPairingMessage, Session,
+    SessionRequest, Transfer,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::header::RETRY_AFTER;
@@ -32,6 +33,14 @@ pub struct Http {
 
 fn group_path(group_id: &[u8; 16]) -> String {
     format!("/v1/groups/{}", Bytes::from(*group_id).encode())
+}
+
+fn file_path(group_id: &[u8; 16], file_id: &[u8; 16]) -> String {
+    format!(
+        "{}/files/{}",
+        group_path(group_id),
+        Bytes::from(*file_id).encode()
+    )
 }
 
 fn slot_path(slot_id: &[u8; 16]) -> String {
@@ -218,6 +227,91 @@ impl Http {
                 }),
         )
         .await
+    }
+
+    pub async fn create_file(
+        &self,
+        token: &str,
+        group_id: &[u8; 16],
+        size: u64,
+    ) -> Result<CreatedFile> {
+        Self::json(
+            self.post(&format!("{}/files", group_path(group_id)))
+                .bearer_auth(token)
+                .json(&CreateFile { size }),
+        )
+        .await
+    }
+
+    pub async fn complete_file(
+        &self,
+        token: &str,
+        group_id: &[u8; 16],
+        file_id: &[u8; 16],
+    ) -> Result<()> {
+        Self::send(
+            self.post(&format!("{}/complete", file_path(group_id, file_id)))
+                .bearer_auth(token),
+        )
+        .await
+        .map(drop)
+    }
+
+    pub async fn file_link(
+        &self,
+        token: &str,
+        group_id: &[u8; 16],
+        file_id: &[u8; 16],
+    ) -> Result<FileLink> {
+        Self::json(self.get(&file_path(group_id, file_id)).bearer_auth(token)).await
+    }
+
+    pub async fn delete_file(
+        &self,
+        token: &str,
+        group_id: &[u8; 16],
+        file_id: &[u8; 16],
+    ) -> Result<()> {
+        Self::send(
+            self.client
+                .delete(format!("{}{}", self.base, file_path(group_id, file_id)))
+                .bearer_auth(token),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Send a file's bytes to the address the server handed out, which may
+    /// be object storage's rather than the server's, and needs no session.
+    pub async fn upload(&self, transfer: &Transfer, data: Vec<u8>) -> Result<()> {
+        if transfer.method != "PUT" {
+            return Err(Error::Malformed(format!(
+                "an upload by {} is not supported",
+                transfer.method
+            )));
+        }
+        Self::send(self.client.put(&transfer.url).body(data))
+            .await
+            .map(drop)
+    }
+
+    /// Fetch at most `max_bytes` from a download address.
+    pub async fn download(&self, transfer: &Transfer, max_bytes: u64) -> Result<Vec<u8>> {
+        if transfer.method != "GET" {
+            return Err(Error::Malformed(format!(
+                "a download by {} is not supported",
+                transfer.method
+            )));
+        }
+        let mut response = Self::send(self.client.get(&transfer.url)).await?;
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            data.extend_from_slice(&chunk);
+            if data.len() as u64 > max_bytes {
+                return Err(Error::Malformed("the file is larger than announced".into()));
+            }
+        }
+        Ok(data)
     }
 
     pub async fn manage_billing(&self, token: &str, group_id: &[u8; 16]) -> Result<BillingLink> {

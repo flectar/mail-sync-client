@@ -8,13 +8,13 @@ use crate::identity::{ChainOp, DeviceIdentity};
 use flectar_mail_sync_crypto::{
     AddDevice, Authorizer, DeleteGroup, DeviceSigningKey, Genesis, GroupState, KemSecretKey, Op,
     OpKind, RECOVERY_ID, RecoveryCode, RemoveDevice, ResetRecovery, RootKey, Rotate,
-    device_binding_message, op_hash, random_bytes, recovery_binding_message, sign_auth, sign_op,
-    unwrap_root_key, wrap_root_key,
+    device_binding_message, file_key, op_hash, open_file, random_bytes, recovery_binding_message,
+    seal_file, sign_auth, sign_op, unwrap_root_key, wrap_root_key,
 };
 use flectar_mail_sync_proto::Limits;
 use flectar_mail_sync_proto::{
-    AppendOp, Billing, Bytes, ChallengeRequest, CreateGroup, ErrorCode, Session, SessionRequest,
-    Wrap,
+    AppendOp, Billing, Bytes, ChallengeRequest, CreateGroup, ErrorCode, FilesInfo, Session,
+    SessionRequest, Wrap,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,6 +35,28 @@ pub(crate) fn now_ms() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+/// A file stored on the server: its id, the key it is sealed under, and
+/// its sealed size. The key never reaches the server; devices pass the whole
+/// reference to each other in records.
+#[derive(Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
+pub struct FileRef {
+    #[zeroize(skip)]
+    pub id: [u8; 16],
+    pub key: [u8; 32],
+    #[zeroize(skip)]
+    pub size: u64,
+}
+
+impl std::fmt::Debug for FileRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileRef")
+            .field("id", &self.id)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A device's secrets: its identity and the root keys it has unwrapped.
@@ -384,6 +406,62 @@ impl SyncClient {
             .authed(|token| async move { self.http.checkout(&token, &group_id, plan).await })
             .await?;
         Ok(link.url)
+    }
+
+    /// What the server stores in files too large for a record, or `None`
+    /// when it stores none.
+    pub async fn files(&self) -> Result<Option<FilesInfo>> {
+        Ok(self.http.info().await?.files)
+    }
+
+    /// Store `plaintext` as a file, sealed under a key of its own that the
+    /// server never sees: keep the returned reference, key included, in a
+    /// record, so the user's other devices can open it.
+    pub async fn upload_file(&self, plaintext: &[u8]) -> Result<FileRef> {
+        let key = file_key()?;
+        let sealed = seal_file(&key, plaintext)?;
+        let size = sealed.len() as u64;
+        let group_id = self.identity.group_id();
+        let created = self
+            .authed(|token| async move { self.http.create_file(&token, &group_id, size).await })
+            .await?;
+        let id: [u8; 16] = created
+            .id
+            .to_array()
+            .ok_or_else(|| Error::Malformed("file id".into()))?;
+        self.http.upload(&created.upload, sealed).await?;
+        self.authed(|token| async move { self.http.complete_file(&token, &group_id, &id).await })
+            .await?;
+        Ok(FileRef { id, key, size })
+    }
+
+    /// The contents of a file another device stored.
+    pub async fn download_file(&self, file: &FileRef) -> Result<Vec<u8>> {
+        let group_id = self.identity.group_id();
+        let id = file.id;
+        let link = self
+            .authed(|token| async move { self.http.file_link(&token, &group_id, &id).await })
+            .await?;
+        if link.size != file.size {
+            return Err(Error::Untrusted(
+                "the file is not the size it was stored with",
+            ));
+        }
+        let sealed = self.http.download(&link.download, file.size).await?;
+        Ok(open_file(&file.key, &sealed)?)
+    }
+
+    /// Remove a file. One already gone counts as removed.
+    pub async fn delete_file(&self, id: &[u8; 16]) -> Result<()> {
+        let group_id = self.identity.group_id();
+        let id = *id;
+        match self
+            .authed(|token| async move { self.http.delete_file(&token, &group_id, &id).await })
+            .await
+        {
+            Err(error) if error.status() == Some(404) => Ok(()),
+            deleted => deleted,
+        }
     }
 
     /// The payment provider's page that changes or cancels the group's

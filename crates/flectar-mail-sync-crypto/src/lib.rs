@@ -8,6 +8,7 @@
 
 mod auth;
 mod chain;
+mod file;
 #[cfg(feature = "kem")]
 mod kem;
 mod keys;
@@ -18,6 +19,7 @@ mod recovery;
 
 pub use auth::{auth_message, sign_auth, verify_auth};
 pub use chain::{GroupState, Member};
+pub use file::{file_key, open_file, seal_file, sealed_file_len};
 #[cfg(feature = "kem")]
 pub use kem::{
     KEM_PUBLIC_KEY_BYTES, KemSecretKey, WRAP_SUITE_XWING_HKDFSHA256_CHACHA20POLY1305,
@@ -56,6 +58,7 @@ pub mod label {
     pub const WRAP: &[u8] = b"flectar-mail-sync/v1 wrap";
     pub const PAIRING: &[u8] = b"flectar-mail-sync/v1 pairing";
     pub const FINGERPRINT: &[u8] = b"flectar-mail-sync/v1 fingerprint";
+    pub const FILE: &[u8] = b"flectar-mail-sync/v1 file";
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

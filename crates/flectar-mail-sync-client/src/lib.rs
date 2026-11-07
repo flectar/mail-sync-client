@@ -23,12 +23,14 @@ mod memory;
 mod pairing;
 mod sse;
 
-pub use client::{Secrets, SyncClient};
+pub use client::{FileRef, Secrets, SyncClient};
 pub use clock::{Clock, Stamp};
 pub use engine::{Entry, Mirrored, Pending, Remote, Store, SyncReport};
 pub use error::{Error, Result, StoreError};
 pub use flectar_mail_sync_crypto::{GroupState, RecoveryCode};
-pub use flectar_mail_sync_proto::{Billing, BillingStatus, ErrorCode, Info, Offer, Plan};
+pub use flectar_mail_sync_proto::{
+    Billing, BillingStatus, ErrorCode, FilesInfo, Info, Offer, Plan,
+};
 pub use http::Http;
 pub use identity::{ChainOp, DeviceIdentity};
 pub use memory::MemoryStore;
