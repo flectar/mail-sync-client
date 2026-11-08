@@ -36,6 +36,14 @@ pub enum Error {
     PaymentRequired,
     #[error("no sync group on this server uses that recovery code")]
     UnknownRecoveryCode,
+    /// No such code: it was mistyped, never made, or this server doesn't
+    /// take codes.
+    #[error("that code doesn't exist")]
+    CodeUnknown,
+    #[error("that code was already used")]
+    CodeUsed,
+    #[error("that code has expired")]
+    CodeExpired,
     #[error("the other device declined")]
     Declined,
     #[error("the pairing expired")]

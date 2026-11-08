@@ -353,8 +353,11 @@ and the app both use it.
 | 402 | `payment_required` | The group's free trial or paid period ended, so uploads wait for a payment (§6.14) |
 | 403 | `forbidden` | The session belongs to another group, or a recovery session asked for something only devices may do |
 | 404 | `not_found` | Unknown group, or no wrap for this session |
+| 404 | `code_unknown` | No such code (§6.14) |
 | 409 | `conflict` | Stale `expectedSeq`, the group id is taken, the recovery key belongs to another group, or the chain moved on |
 | 409 | `stale_epoch` | A record was sealed for another epoch than the current one: read the chain, fetch the root key and seal again |
+| 409 | `code_used` | The code was redeemed already (§6.14) |
+| 409 | `code_expired` | The code was not redeemed in time (§6.14) |
 | 410 | `gone` | `since` is below the tombstone horizon; read again from 0 |
 | 410 | `group_deleted` | The group was deleted |
 | 413 | `payload_too_large` | Over a size or batch limit |
@@ -526,7 +529,10 @@ Effects:
 - **reset_recovery:** drops the old recovery wrap and ends recovery sessions.
   A new key that belongs to another group answers `409`.
 - **delete_group:** erases the group's records, wraps, devices, chain and
-  recovery key. A marker keeps the id from being used again.
+  recovery key. A marker keeps the id from being used again. A group no
+  device has signed in to for the unused group lifetime (§9) is erased the
+  same way, unless its subscription is still paid for or a code still makes
+  it free (§6.14).
 
 ### 6.11 `GET /v1/groups/{group}/wrap`
 
@@ -575,6 +581,7 @@ header in seconds. Limits are bursts refilled at a steady rate (GCRA):
 | `GET /v1/pairing/codes/{code}` | client address | 5 | 1 per 30 s |
 | endpoints with a session | group | 300 | 1 per 100 ms |
 | `POST …/billing/checkout`, `POST …/billing/manage` | group | 5 | 1 per min |
+| `POST …/billing/redeem` | group | 5 | 1 per 10 min |
 
 - **Client address:** IPv6 addresses count per /64 network.
 - **Behind a proxy:** when the connecting peer is a configured trusted
@@ -604,11 +611,14 @@ doesn't charge, every group syncs for free.
   - `trial`: in the free trial, which ends at `trialEndsAt`.
   - `active`: paid until `paidUntil`.
   - `past_due`: a renewal failed and is being retried.
-  - `expired`: the trial or paid period ended.
+  - `granted`: free until `freeUntil`, through redeemed codes. A
+    subscription shows before it, and it shows before the trial.
+  - `expired`: the trial, paid period or free period ended.
   - A client that meets a status it does not know shows no billing state.
     The `402` answers below still tell it when uploads stop.
-- `trialEndsAt`, `paidUntil`: milliseconds since the Unix epoch.
-  `paidUntil` is the end of the last paid period.
+- `trialEndsAt`, `paidUntil`, `freeUntil`: milliseconds since the Unix
+  epoch. `paidUntil` is the end of the last paid period, and `freeUntil` the
+  end of the free period that redeemed codes gave the group.
 - `renews`: the subscription renews at `paidUntil`.
 - `plans`: as in `/v1/info`. `amount` is in the currency's smallest unit;
   `taxIncluded` says whether it includes tax. The provider may charge in the
@@ -636,8 +646,29 @@ payment is retried.
   the group has never subscribed.
 - On a server that doesn't charge, both answer `404`.
 
+**Codes.** Whoever runs the server can hand out codes that make syncing
+free for a while, such as a year for someone who contributed.
+
+- `POST /v1/groups/{group}/billing/redeem` with `{"code"}` answers the
+  group's billing state, as above, and sends a `billing` event to its
+  devices.
+- A code is 16 characters of Crockford's base 32, shown in groups of four
+  such as `7KQ2-M9XD-T4RB-WH3E`. Case, spaces and dashes don't matter, and
+  `O`, `I` and `L` read as `0`, `1` and `1`.
+- Each code works once, for any group. Its days start when the group's
+  trial, paid period or earlier free period ends, whichever is last, so none
+  of them is cut short. A group that keeps a subscription keeps paying for
+  it.
+- Errors: `404 code_unknown`, `409 code_used`, and `409 code_expired` for a
+  code not redeemed in time. On a server that doesn't charge, `404`.
+- The server keeps only a hash of each code, and doesn't record which group
+  redeemed it. The reference server creates codes with
+  `flectar-mail-sync-server codes create`, which prints them.
+
 A `delete_group` operation (§5.3) also ends the group's open checkout and
-cancels its subscription.
+cancels its subscription, then forgets the group's billing state: nothing
+links a deleted group to the provider's customer any more. Billing requests
+for a deleted group answer `410`, like every other request.
 
 **Provider (informative).** The reference server sells through Stripe
 Managed Payments, with Stripe as merchant of record: Stripe collects the
@@ -784,6 +815,7 @@ the ones clients must respect.
 | Sealed file | 26 MiB |
 | File bytes per group | 512 MiB |
 | File lifetime | 60 days |
+| Unused group lifetime | 2 years without a sign-in |
 
 ## 10. Security considerations
 
@@ -816,7 +848,8 @@ the ones clients must respect.
 - **Billing:** on a server that charges, the payment provider links a
   paying group to whoever paid: their name, email address and payment
   details. The server stores only the provider's customer and subscription
-  ids. Records stay unreadable either way.
+  ids. Records stay unreadable either way. A code links a group to no one:
+  the server keeps only the code's hash and the end of the free period.
 - **Logins:** login signatures are bound to the server URL and to a
   single-use nonce. Session tokens are random and stored only as SHA-256
   hashes.

@@ -561,6 +561,12 @@ pub enum ErrorCode {
     /// The group's free trial or paid period ended: uploads resume once it
     /// is paid. Reading, removing devices and deleting still work.
     PaymentRequired,
+    /// No such code: it was mistyped, or never made.
+    CodeUnknown,
+    /// The code was redeemed already. Each code works once.
+    CodeUsed,
+    /// The code was not redeemed in time.
+    CodeExpired,
     RateLimited,
     Internal,
     /// A code this version does not know, from a newer server.
@@ -581,6 +587,10 @@ pub struct Billing {
     /// End of the paid period, in milliseconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_until: Option<i64>,
+    /// End of the free period that redeemed codes gave the group, in
+    /// milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_until: Option<i64>,
     /// The subscription renews when the paid period ends.
     #[serde(default)]
     pub renews: bool,
@@ -597,6 +607,7 @@ impl Billing {
             status: BillingStatus::Free,
             trial_ends_at: None,
             paid_until: None,
+            free_until: None,
             renews: false,
             plans: Vec::new(),
         }
@@ -615,6 +626,8 @@ pub enum BillingStatus {
     /// A renewal payment failed and is being retried; uploads continue for
     /// a while.
     PastDue,
+    /// Free until `freeUntil`, through a redeemed code.
+    Granted,
     /// The trial or paid period ended: uploads wait for a payment.
     Expired,
     /// A status this version does not know, from a newer server.
@@ -645,6 +658,14 @@ pub struct Plan {
 pub struct CheckoutRequest {
     /// A [`Plan::id`].
     pub plan: String,
+}
+
+/// `POST /v1/groups/{group}/billing/redeem`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemRequest {
+    /// The code as the user typed it: case, spaces and dashes don't matter.
+    pub code: String,
 }
 
 /// A page of the payment provider to open in the browser: a checkout, or
@@ -697,6 +718,7 @@ mod tests {
             status: BillingStatus::PastDue,
             trial_ends_at: None,
             paid_until: Some(5),
+            free_until: None,
             renews: true,
             plans: vec![Plan {
                 id: "yearly".into(),
@@ -711,6 +733,13 @@ mod tests {
         assert_eq!(json["paidUntil"], 5);
         assert_eq!(json["plans"][0]["taxIncluded"], true);
         assert!(json.get("trialEndsAt").is_none());
+        assert!(json.get("freeUntil").is_none());
+
+        let granted: Billing =
+            serde_json::from_str(r#"{"enabled": true, "status": "granted", "freeUntil": 7}"#)
+                .unwrap();
+        assert_eq!(granted.status, BillingStatus::Granted);
+        assert_eq!(granted.free_until, Some(7));
     }
 
     #[test]

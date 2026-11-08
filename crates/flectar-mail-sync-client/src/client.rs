@@ -408,6 +408,20 @@ impl SyncClient {
         Ok(link.url)
     }
 
+    /// Redeem a code that makes syncing free for a while, as the user typed
+    /// it, and return what the group pays now.
+    pub async fn redeem_code(&self, code: &str) -> Result<Billing> {
+        let group_id = self.identity.group_id();
+        self.authed(|token| async move { self.http.redeem(&token, &group_id, code).await })
+            .await
+            .map_err(|error| match error.code() {
+                Some(ErrorCode::CodeUnknown | ErrorCode::NotFound) => Error::CodeUnknown,
+                Some(ErrorCode::CodeUsed) => Error::CodeUsed,
+                Some(ErrorCode::CodeExpired) => Error::CodeExpired,
+                _ => error,
+            })
+    }
+
     /// What the server stores in files too large for a record, or `None`
     /// when it stores none.
     pub async fn files(&self) -> Result<Option<FilesInfo>> {

@@ -7,8 +7,8 @@ use flectar_mail_sync_proto::{
     AppendOp, Appended, Billing, BillingLink, Bytes, Challenge, ChallengeRequest, Changes,
     CheckoutRequest, CommitRequest, CommitResponse, Conflict, CreateFile, CreateGroup,
     CreatePairing, CreatedFile, CurrentWrap, ErrorBody, ErrorCode, FileLink, GroupCreated, Info,
-    OpsPage, PairingCreated, PairingMessages, PairingSlot, PutPairingMessage, Session,
-    SessionRequest, Transfer,
+    OpsPage, PairingCreated, PairingMessages, PairingSlot, PutPairingMessage, RedeemRequest,
+    Session, SessionRequest, Transfer,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::header::RETRY_AFTER;
@@ -312,6 +312,17 @@ impl Http {
             }
         }
         Ok(data)
+    }
+
+    pub async fn redeem(&self, token: &str, group_id: &[u8; 16], code: &str) -> Result<Billing> {
+        Self::json(
+            self.post(&format!("{}/billing/redeem", group_path(group_id)))
+                .bearer_auth(token)
+                .json(&RedeemRequest {
+                    code: code.to_owned(),
+                }),
+        )
+        .await
     }
 
     pub async fn manage_billing(&self, token: &str, group_id: &[u8; 16]) -> Result<BillingLink> {
