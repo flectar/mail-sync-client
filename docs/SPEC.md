@@ -661,9 +661,9 @@ free for a while, such as a year for someone who contributed.
   it.
 - Errors: `404 code_unknown`, `409 code_used`, and `409 code_expired` for a
   code not redeemed in time. On a server that doesn't charge, `404`.
-- The server keeps only a hash of each code, and doesn't record which group
-  redeemed it. The reference server creates codes with
-  `flectar-mail-sync-server codes create`, which prints them.
+- The server keeps only a hash of each code, and when it was redeemed. The
+  reference server creates codes with `flectar-mail-sync-server codes
+  create`, which prints them.
 
 A `delete_group` operation (§5.3) also ends the group's open checkout and
 cancels its subscription, then forgets the group's billing state: nothing
@@ -848,8 +848,9 @@ the ones clients must respect.
 - **Billing:** on a server that charges, the payment provider links a
   paying group to whoever paid: their name, email address and payment
   details. The server stores only the provider's customer and subscription
-  ids. Records stay unreadable either way. A code links a group to no one:
-  the server keeps only the code's hash and the end of the free period.
+  ids. Records stay unreadable either way. For a code, the server keeps its
+  hash, when it was redeemed, and the end of the group's free period; whoever
+  hands out codes knows whom each one went to.
 - **Logins:** login signatures are bound to the server URL and to a
   single-use nonce. Session tokens are random and stored only as SHA-256
   hashes.
