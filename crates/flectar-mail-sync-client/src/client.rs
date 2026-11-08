@@ -607,10 +607,13 @@ impl SyncClient {
     /// Create the group again from our genesis, if the server lost it.
     async fn restore_group(&self, chain: &mut Verified) -> Result<()> {
         let genesis = &chain.ops[0];
+        // The server lost the group, so whatever it paid is gone with it:
+        // a trial again is the least it owes.
         let request = CreateGroup {
             op: Bytes(genesis.op.clone()),
             signatures: genesis.signatures.iter().cloned().map(Bytes).collect(),
             wraps: self.wraps_for(chain, 0)?,
+            no_trial: false,
         };
         match self.http.create_group(&request).await {
             Ok(_) => {
@@ -973,6 +976,23 @@ impl SyncClient {
         http: reqwest::Client,
         server_url: &str,
     ) -> Result<(Self, RecoveryCode)> {
+        Self::create(http, server_url, false).await
+    }
+
+    /// [`Self::create_group`] for a device that had a free trial on this
+    /// server before: a server that charges starts the group without one.
+    pub async fn create_group_without_trial(
+        http: reqwest::Client,
+        server_url: &str,
+    ) -> Result<(Self, RecoveryCode)> {
+        Self::create(http, server_url, true).await
+    }
+
+    async fn create(
+        http: reqwest::Client,
+        server_url: &str,
+        no_trial: bool,
+    ) -> Result<(Self, RecoveryCode)> {
         let code = RecoveryCode::generate()?;
         let recovery = code.signing_key();
         let recovery_kem = KemSecretKey::derive(&code.kem_seed());
@@ -1011,6 +1031,7 @@ impl SyncClient {
                 wrap(&recovery_kem.public_key(), RECOVERY_ID)?,
                 wrap(&device_kem, device_id)?,
             ],
+            no_trial,
         };
         Http::new(http.clone(), server_url)
             .create_group(&request)

@@ -218,6 +218,10 @@ pub struct CreateGroup {
     /// Epoch 1 wraps: the recovery key's (required) and the device's
     /// (optional).
     pub wraps: Vec<Wrap>,
+    /// The device had a free trial on this server before: the group starts
+    /// without one. Servers that don't charge ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_trial: bool,
 }
 
 /// One operation of a group's chain.

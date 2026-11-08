@@ -373,7 +373,7 @@ Clients handle codes they do not know by the HTTP status.
 {"server": "flectar-mail-sync", "version": "0.1.0", "protocolMin": 1, "protocolMax": 1,
  "limits": {"maxRecordBytes": 262144, "maxBatchRecords": 1000, "maxRequestBytes": 8388608,
             "maxGroupBytes": 67108864, "maxPageRecords": 1000, "maxDevices": 25},
- "billing": {"trialDays": 30, "plans": [
+ "billing": {"trialDays": 14, "plans": [
    {"id": "monthly", "amount": 500, "currency": "eur", "interval": "month", "taxIncluded": true},
    {"id": "yearly", "amount": 4800, "currency": "eur", "interval": "year", "taxIncluded": true}]}}
 ```
@@ -387,6 +387,8 @@ Request: `{"op": <genesis>, "signatures": [<recovery>, <device>], "wraps": [{"ta
 
 - **Wraps:** epoch 1 wraps. The recovery wrap is required; the device's own
   wrap is optional.
+- **No trial:** `"noTrial": true` asks a server that charges to start the
+  group without a free trial (§6.14).
 - **Success:** `201 {"groupId", "highSeq": 0}`.
 - **Taken id or recovery key:** `409`. The id of a deleted group is never used
   again; its recovery key is free again.
@@ -625,7 +627,10 @@ doesn't charge, every group syncs for free.
   buyer's own currency.
 
 The trial starts the first time the server sees the group: at its first
-upload or billing request.
+upload or billing request. A group created with `noTrial` has none. Devices
+remember that they had a trial on a server, and ask for none when they
+start a group there again, so starting over doesn't bring another trial.
+Servers that don't charge ignore `noTrial`.
 
 **Uploads.** While the group's status is `expired`, a commit that stores
 records answers `402 payment_required`. Everything else keeps working:
