@@ -13,7 +13,9 @@ use crate::http::CommitOutcome;
 use crate::identity::ChainOp;
 use crate::sse::Event;
 use flectar_mail_sync_crypto::{RootKey, collection_tag, open_record, seal_record};
-use flectar_mail_sync_proto::{Bytes, CommitItem, CommitRequest, ErrorCode, Limits, Record};
+use flectar_mail_sync_proto::{
+    Bytes, CommitItem, CommitRequest, Conflict, ErrorCode, Limits, Record,
+};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -152,8 +154,17 @@ pub struct SyncReport {
     pub unreadable: usize,
     pub high_seq: u64,
     /// The server refused uploads until the group pays (SPEC §6.14). What
-    /// was downloaded is in the store; local changes stay pending.
+    /// was downloaded is in the store; deletions went through, and other
+    /// local changes stay pending.
     pub payment_required: bool,
+    /// Why the server refused uploads, when trying again at once won't
+    /// help: the group is out of storage, or the server is full or takes
+    /// smaller requests. What was downloaded is in the store; local changes
+    /// stay pending.
+    pub upload_refused: Option<ErrorCode>,
+    /// Local changes larger than the server takes, left pending until they
+    /// shrink.
+    pub too_large: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -276,8 +287,47 @@ enum FullRead {
 
 enum Pushed {
     Done,
-    Conflicts,
+    /// Nothing was stored: these records changed on the server.
+    Conflicts(Vec<Conflict>),
     StaleEpoch,
+}
+
+/// What a push uploads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Uploads {
+    All,
+    /// Only deletions, which a group that must pay may still make.
+    Deletions,
+}
+
+/// Errors that refuse a device's uploads for longer than a retry: what it
+/// downloaded still counts.
+fn refuses_uploads(error: &Error) -> bool {
+    matches!(
+        error.code(),
+        Some(ErrorCode::QuotaExceeded | ErrorCode::ServerFull | ErrorCode::PayloadTooLarge)
+    )
+}
+
+/// The record id of a conflict.
+fn conflict_id(conflict: &Conflict) -> Option<[u8; 16]> {
+    conflict.record_id.0.as_slice().try_into().ok()
+}
+
+/// After a commit conflicted, the pull brought every newer version this
+/// device could read, and rebased its changes on them. A version it could
+/// not read never comes: the change goes over it, on the server's `seq`.
+fn rebase_unreadable(store: &mut dyn Store, conflicts: &[Conflict]) -> Result<()> {
+    for conflict in conflicts {
+        let Some(id) = conflict_id(conflict) else {
+            continue;
+        };
+        let seen = self::store(store.mirrored(&id))?.map_or(0, |mirrored| mirrored.seq);
+        if seen < conflict.current_seq {
+            self::store(store.requeue(&id, conflict.current_seq))?;
+        }
+    }
+    Ok(())
 }
 
 impl SyncClient {
@@ -320,16 +370,27 @@ impl SyncClient {
         self.refresh().await?;
         self.rotate_if_due().await?;
         self.persist(store).await?;
+        let mut conflicts = Vec::new();
         for _ in 0..SYNC_ROUNDS {
             self.pull(store, &mut report).await?;
-            match self.push(store, &mut report).await {
+            rebase_unreadable(store, &conflicts)?;
+            match self.push(store, &mut report, Uploads::All).await {
                 Ok(Pushed::Done) => break,
-                Ok(Pushed::Conflicts) => {}
+                Ok(Pushed::Conflicts(found)) => conflicts = found,
                 Ok(Pushed::StaleEpoch) => {
                     self.refresh().await?;
                 }
                 Err(Error::PaymentRequired) => {
                     report.payment_required = true;
+                    // Deleting stays possible (SPEC §6.14). A failure here
+                    // leaves them for the next sync; the pull still counts.
+                    if let Err(error) = self.push(store, &mut report, Uploads::Deletions).await {
+                        tracing::debug!(%error, "deletions wait for the next sync");
+                    }
+                    break;
+                }
+                Err(error) if refuses_uploads(&error) => {
+                    report.upload_refused = error.code();
                     break;
                 }
                 Err(error) => return Err(error),
@@ -410,6 +471,9 @@ impl SyncClient {
                 });
             }
             let last = page.records.last().map_or(since, |record| record.seq);
+            if page.more && last <= since {
+                return Err(crate::client::stalled_page());
+            }
             let next = if page.more {
                 last
             } else {
@@ -463,24 +527,38 @@ impl SyncClient {
         open(&self.root_key(epoch).await?, group_id, record)
     }
 
-    async fn push(&self, store: &mut dyn Store, report: &mut SyncReport) -> Result<Pushed> {
+    async fn push(
+        &self,
+        store: &mut dyn Store,
+        report: &mut SyncReport,
+        uploads: Uploads,
+    ) -> Result<Pushed> {
         let group_id = self.identity.group_id();
         let limits = self.limits().await?;
         let (epoch, root) = self.current_root().await?;
         // Ciphertext travels as base64 inside JSON; leave room for both.
         let budget = limits.max_request_bytes / 2;
+        let batch_records = limits.max_batch_records as usize;
+        let mut too_large = HashSet::new();
         for _ in 0..MAX_BATCHES {
-            let pending = self::store(store.pending(limits.max_batch_records as usize))?;
-            if pending.is_empty() {
-                return Ok(Pushed::Done);
-            }
+            let pending: Vec<Pending> = match uploads {
+                Uploads::All => self::store(store.pending(batch_records))?,
+                Uploads::Deletions => self::store(store.pending(usize::MAX))?
+                    .into_iter()
+                    .filter(|change| change.entry.is_none())
+                    .take(batch_records)
+                    .collect(),
+            };
             let mut items = Vec::new();
             let mut batch = Vec::new();
             let mut bytes = 0u64;
+            let mut discarded = false;
             for change in pending {
+                // Created and deleted before it ever reached the server, or
+                // the server lost it: there is nothing there to delete.
                 if change.entry.is_none() && change.base_seq == 0 {
-                    // Created and deleted before it ever reached the server.
                     self::store(store.discard(&change))?;
+                    discarded = true;
                     continue;
                 }
                 let item = seal(&root, &group_id, epoch, &change)?;
@@ -489,18 +567,17 @@ impl SyncClient {
                     .as_ref()
                     .map_or(0, |ciphertext| ciphertext.len() as u64);
                 if size > limits.max_record_bytes {
-                    return Err(Error::Server {
-                        status: 413,
-                        code: ErrorCode::PayloadTooLarge,
-                        message: format!(
-                            "a {} record is larger than the server's limit",
-                            change
+                    if too_large.insert(change.record_id) {
+                        tracing::warn!(
+                            collection = change
                                 .entry
                                 .as_ref()
-                                .map_or("", |entry| entry.collection.as_str())
-                        ),
-                        retry_after: None,
-                    });
+                                .map_or("", |entry| entry.collection.as_str()),
+                            "a record is larger than the server takes; it waits"
+                        );
+                        report.too_large += 1;
+                    }
+                    continue;
                 }
                 if !items.is_empty() && bytes + size > budget {
                     break;
@@ -510,7 +587,10 @@ impl SyncClient {
                 batch.push(change);
             }
             if items.is_empty() {
-                continue;
+                if discarded {
+                    continue;
+                }
+                return Ok(Pushed::Done);
             }
             let request = CommitRequest { items };
             let request = &request;
@@ -528,7 +608,7 @@ impl SyncClient {
                     self::store(store.set_seen(seen.max(response.high_seq)))?;
                     report.pushed += committed.len();
                 }
-                Ok(CommitOutcome::Conflicts(_)) => return Ok(Pushed::Conflicts),
+                Ok(CommitOutcome::Conflicts(conflicts)) => return Ok(Pushed::Conflicts(conflicts)),
                 Err(error) if error.code() == Some(ErrorCode::StaleEpoch) => {
                     return Ok(Pushed::StaleEpoch);
                 }

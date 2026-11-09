@@ -349,23 +349,41 @@ and the app both use it.
 | Status | `code` | Meaning |
 |---|---|---|
 | 400 | `bad_request` | Malformed request, or an operation that breaks §5.4 |
-| 401 | `unauthorized` | Missing or invalid session, or a failed login |
+| 401 | `unauthorized` | Missing or invalid session |
+| 401 | `challenge_expired` | A login's challenge expired, was used, or is gone: ask for a new one (§6.4) |
+| 401 | `device_unknown` | The server could not confirm a login. Not a removal (§6.4) |
 | 402 | `payment_required` | The group's free trial or paid period ended, so uploads wait for a payment (§6.14) |
 | 403 | `forbidden` | The session belongs to another group, or a recovery session asked for something only devices may do |
+| 403 | `device_removed` | A login signed by the key of a device the chain removed (§6.4) |
 | 404 | `not_found` | Unknown group, or no wrap for this session |
 | 404 | `code_unknown` | No such code (§6.14) |
+| 408 | `request_timeout` | The request, or its body, took longer than the server waits; try again |
 | 409 | `conflict` | Stale `expectedSeq`, the group id is taken, the recovery key belongs to another group, or the chain moved on |
 | 409 | `stale_epoch` | A record was sealed for another epoch than the current one: read the chain, fetch the root key and seal again |
+| 409 | `already_subscribed` | A checkout was refused: the group already has a subscription; open the management page instead (§6.14) |
 | 409 | `code_used` | The code was redeemed already (§6.14) |
 | 409 | `code_expired` | The code was not redeemed in time (§6.14) |
 | 410 | `gone` | `since` is below the tombstone horizon; read again from 0 |
 | 410 | `group_deleted` | The group was deleted |
+| 411 | `bad_request` | A commit came without `Content-Length` (§6.5) |
 | 413 | `payload_too_large` | Over a size or batch limit |
 | 429 | `rate_limited` | Too many requests |
 | 507 | `quota_exceeded` | The group would exceed its storage quota or device limit |
+| 507 | `chain_full` | The group's chain holds as many operations as the server keeps (§6.10) |
+| 507 | `server_full` | The server is short of disk space for now: new groups, commits that store records, and new files wait. Reading, deleting and changing members go on. Try again later |
 | 500 | `internal` | Server failure |
 
 Clients handle codes they do not know by the HTTP status.
+
+A request's answer must begin within 30 s, its body included; past that the
+server answers `408`. Commits get 2 minutes, and uploads to a server's own
+file addresses 10. A commit's body must also keep up at least 16 KiB/s after
+its first 15 s, or it answers `408 request_timeout`, and a page of records or
+operations must go out as fast, or the server cuts it off. Once a client
+stops reading what the server sends, it must take 64 KiB within 30 s, or the
+server closes the connection. A change the server stored takes effect, and
+is announced to the group's devices, even when its request ends before the
+answer.
 
 ### 6.2 `GET /v1/info`
 
@@ -379,7 +397,9 @@ Clients handle codes they do not know by the HTTP status.
 ```
 
 `billing` appears only on a server that charges (§6.14), so devices can
-show the price before a group is created.
+show the price before a group is created. There, `limits.maxGroupBytes` and
+`files.maxGroupFileBytes` are the quotas of a group that pays; a group that
+doesn't gets smaller ones (§6.14).
 
 ### 6.3 `POST /v1/groups`
 
@@ -405,8 +425,24 @@ Request: `{"op": <genesis>, "signatures": [<recovery>, <device>], "wraps": [{"ta
      exist.
 2. `POST /v1/auth/session` with `{"challengeId", "signature"}` takes the
    signature over the login message (§4.7). It returns
-   `{"token", "expiresAt", "groupId"}`, and the session lasts one hour.
-3. Any failure is `401`.
+   `{"token", "expiresAt", "groupId"}`, and the session lasts one hour. A
+   device, or recovery, keeps at most 16 sessions; a newer one ends the
+   oldest.
+3. A refused login says why only as far as its signature allows:
+   - `401 challenge_expired`: the challenge expired, was used, or the
+     server no longer holds it, as after a restart. Ask for a new one.
+   - `401 device_unknown`: the server could not confirm the login. It
+     doesn't know the group, or the device in it, or the signature doesn't
+     check against the device's key, as when the server's address is not
+     the one devices sign for. This is not a removal: a server restored
+     from a backup may have lost the group, or the operation that added
+     the device, until a device appends it again (§8).
+   - `403 device_removed`: the signature checks against the key of a device
+     the chain removed.
+   - `410 group_deleted`: the group was deleted.
+   Apart from `challenge_expired`, a recovery login fails with
+   `401 device_unknown` whatever the reason, so the endpoint doesn't reveal
+   which recovery keys are in use.
 
 **Recovery sessions:** recovery learns its group from the session response.
 It must then check that the chain's current recovery key is its own. A
@@ -420,19 +456,22 @@ recovery session may only:
   recovery is reset.
 - After a group is deleted, its sessions last until they expire, and every
   request answers `410 group_deleted`. Devices still connected learn of the
-  deletion that way.
+  deletion that way, and the others when they log in.
 
 ### 6.5 `POST /v1/groups/{group}/commit`
 
 This endpoint is for device sessions only.
 
 `{"items": [item, …]}`, applied atomically: either every item is stored or
-none.
+none. The request must carry `Content-Length`, or it answers `411`; one
+longer than `maxRequestBytes` answers `413` before its body is read.
 
 - **Put:** `{"recordId", "expectedSeq", "tag", "epoch", "nonce", "ciphertext"}`.
 - **Delete:** `{"recordId", "expectedSeq", "deleted": true}`.
 
 Rules:
+- A `ciphertext` has at least 272 bytes, the length of an empty record
+  once padded and sealed (§4.5); shorter ones answer `400`.
 - `expectedSeq` must equal the record's current `seq`, or 0 if the record
   does not exist (a tombstone counts as existing). Otherwise the answer is
   `409` with every stale record and its `currentSeq`, and nothing is stored.
@@ -442,6 +481,9 @@ Rules:
   `409 stale_epoch`. This happens when another device rotated the key.
 - Size, batch and quota limits come from `/v1/info`. A commit that does not
   grow the group is accepted even over quota.
+- **Quota:** each record and each tombstone counts 256 bytes on top of its
+  tag, nonce and ciphertext, so tombstones fill the quota too until they
+  are dropped (§6.6). Chain operations count as well (§6.10).
 
 Success returns `{"highSeq", "results": [{"recordId", "seq"}, …]}`. The
 results are in item order, with consecutive sequence numbers.
@@ -455,7 +497,9 @@ snapshot: `{"records": [...], "highSeq", "more"}`. A tombstone carries only
 `recordId`, `seq` and `"deleted": true`.
 
 - **Paging:** if `more` is true, ask again with `since` set to the last
-  `seq`. `limit` defaults to, and is capped at, `maxPageRecords`.
+  `seq`. `limit` defaults to, and is capped at, `maxPageRecords`. A page
+  also ends before the record that would take it past about 2 MiB of
+  records, so it may hold fewer, but always at least one.
 - **Tombstone horizon:** tombstones are dropped after the server's retention
   period (180 days by default). The group's horizon is the highest dropped
   `seq`.
@@ -488,6 +532,9 @@ Clients ignore event types they do not know.
 
 - The server sends keep-alive comments every 15 s. Clients reconnect with
   backoff.
+- A group keeps at most twice as many streams open as it had devices when
+  the session logged in, and the server 32768 in all by default, at most
+  half the files it may open; past that, opening one answers `429`.
 - The stream ends when the server shuts down, when a device of the group is
   removed, or when the group is deleted.
 
@@ -507,11 +554,20 @@ already trusts: one it verified before, or the one a pairing gave it.
 
 Request: `{"op", "signatures", "wraps"}`.
 
-1. The server replays the stored chain, checks the operation with §5.4, and
+1. An operation for an index that already exists answers `409`; the client
+   reads the chain again and rebuilds the operation. One that skips an
+   index, or names another group, answers `400`. Both are refused before
+   the chain is replayed or anything is written.
+2. The server replays the stored chain, checks the operation with §5.4, and
    applies it.
-2. An operation for an index that already exists answers `409`; the client
-   reads the chain again and rebuilds the operation.
 3. Success returns `{"headIndex", "epoch"}`.
+
+**Limit.** A chain holds at most 1000 operations, years of adding and
+replacing devices. Past that, the server answers `507 chain_full` to every
+operation but `remove_device`, a `rotate` while one is due (§5.4), and
+`delete_group`. A full chain gains no devices, so those run out; they keep
+a group able to drop a device and to delete itself. To add devices again,
+start a new group.
 
 The wraps must be exactly what the kind allows. They are stored for the epoch
 current after the operation.
@@ -523,10 +579,22 @@ current after the operation.
 | reset_recovery | none | `RECOVERY_ID` (for the new recovery key) |
 | remove_device, move_server, delete_group | none | none |
 
+Each operation counts its own bytes, its signatures and 256 bytes against
+the group's quota. One that would exceed it answers `507 quota_exceeded`,
+unless it is one a full chain still takes (see **Limit** above) or a
+`reset_recovery`, so a code that leaked can always be replaced.
+
 Effects:
-- **add_device:** answers `507` when it would exceed `maxDevices`.
+- **add_device:** answers `507` when it would exceed `maxDevices`. Only an
+  addition is held to the limit: a group over a limit the server lowered
+  since still removes devices and rotates.
 - **remove_device:** drops the device's wraps, ends its sessions, and ends the
-  group's event streams.
+  group's event streams. When it removes the last device, on a server that
+  charges, the group's subscription stops renewing and ends with the period
+  that is paid, since no device is left to stop it, and its open checkout
+  ends; the server records this with the operation and tries again until
+  the provider has done it. The recovery code can still bring a device
+  back.
 - **rotate:** drops wraps of older epochs.
 - **reset_recovery:** drops the old recovery wrap and ends recovery sessions.
   A new key that belongs to another group answers `409`.
@@ -577,21 +645,42 @@ header in seconds. Limits are bursts refilled at a steady rate (GCRA):
 
 | Endpoints | Counted per | Default burst | Default refill |
 |---|---|---|---|
-| `POST /v1/groups` | client address | 5 | 1 per 6 min |
+| `GET /v1/info` | client address | 120 | 1 per 250 ms |
+| `POST /v1/groups` | client address | 5 | 1 per 4 h |
 | `POST /v1/auth/challenge`, `POST /v1/auth/session` | client address | 40 | 1 per 5 s |
 | pairing slots and messages | client address | 60 | 1 per 2 s |
 | `GET /v1/pairing/codes/{code}` | client address | 5 | 1 per 30 s |
+| `GET /v1/pairing/codes/{code}` that finds nothing | network: an IPv4 /24, an IPv6 /48 | 10 | 1 per 30 s; while over it, every lookup from the network answers `429` |
+| `GET /v1/pairing/codes/{code}` that finds nothing | server | 120 | 1 per 500 ms; while over it, every lookup answers `429` |
 | endpoints with a session | group | 300 | 1 per 100 ms |
+| `POST …/ops` | group | 30 | 1 per min |
 | `POST …/billing/checkout`, `POST …/billing/manage` | group | 5 | 1 per min |
 | `POST …/billing/redeem` | group | 5 | 1 per 10 min |
+| `POST …/files` | group | 20 | 1 per min |
 
 - **Client address:** IPv6 addresses count per /64 network.
 - **Behind a proxy:** when the connecting peer is a configured trusted
   proxy, the client address is the rightmost `X-Forwarded-For` entry that is
   not a trusted proxy. Entries to its left come from the client and are
   ignored.
-- **Too many pairings:** when too many slots are open, `POST /v1/pairing`
-  also answers `429`.
+- **Caps per address:** an address keeps at most 64 pending login
+  challenges and 8 open pairing slots, and the server 100000 and 4096.
+  Past an address's cap its oldest makes room, and past the server's, the
+  oldest of the address holding the most: a new login or pairing is never
+  refused for it, and a few busy addresses can't push out everyone else's.
+- **In flight:** a group may have 4 requests with a session in flight at
+  once for each device it had when the session logged in, at least 8 and
+  at most 64, and the server 1024 in all; past either, `429`. An event
+  stream counts only while it opens, and a commit counts in the server's
+  1024 only once its body is in. A page of records or operations counts
+  until the last of it is sent.
+- **Heavy requests:** commits, pages of records or operations, and chain
+  appends, which replay the chain, also wait up to 10 s for one of the
+  server's 32 slots for them, then answer `429`. A group takes at most one
+  slot per device, at least 2 and at most 8, and a page holds its slot
+  until the last of it is sent. Commits also wait for room for their
+  bodies: the server reads at most 128 MiB of them at once, and a group an
+  eighth of that, or one commit of `maxRequestBytes` if more.
 
 ### 6.14 Billing
 
@@ -612,7 +701,8 @@ doesn't charge, every group syncs for free.
   - `free`: nothing to pay.
   - `trial`: in the free trial, which ends at `trialEndsAt`.
   - `active`: paid until `paidUntil`.
-  - `past_due`: a renewal failed and is being retried.
+  - `past_due`: a renewal failed. It stays so until the payment goes
+    through or the subscription ends; uploads stop after a while (below).
   - `granted`: free until `freeUntil`, through redeemed codes. A
     subscription shows before it, and it shows before the trial.
   - `expired`: the trial, paid period or free period ended.
@@ -636,19 +726,30 @@ Servers that don't charge ignore `noTrial`.
 records answers `402 payment_required`. Everything else keeps working:
 reading, deleting records, adding and removing devices, and deleting the
 group. A paid period stays usable for 3 days after `paidUntil` while the
-renewal arrives. A `past_due` period stays usable for 14 days while the
-payment is retried.
+renewal arrives. A `past_due` group may upload for 14 days from the first
+failed payment, however often its period renews unpaid; after that it stays
+`past_due` and its uploads answer `402` until the payment goes through, so
+devices offer the management page, where it can be fixed.
+
+**Storage.** A group that doesn't pay, in its trial or after it, may store
+8 MiB of records and chain (§6.5) and 32 MiB of files (§6.15) by default.
+Paying, or a free period from a code, gives it the quotas `/v1/info`
+reports. Past either, uploads answer `507 quota_exceeded`.
 
 **Pages.** Paying happens in the browser, on pages of the payment provider:
 
 - `POST /v1/groups/{group}/billing/checkout` with `{"plan": "yearly"}`
   answers `{"url"}`, a checkout for the plan. What is left of the trial
-  carries over when at least two days remain. Opening a checkout ends the
-  group's previous one, so a group is never charged twice. It answers `400`
-  for an unknown plan, and `409` when the group already pays.
+  carries over when more than 49 hours remain (the provider needs 48).
+  Opening a checkout ends the group's previous one, so a group is never
+  charged twice. It answers `400` for an unknown plan, and
+  `409 already_subscribed` when the group already has a subscription, even
+  one still waiting for its first payment: devices then open the
+  management page instead.
 - `POST /v1/groups/{group}/billing/manage` answers `{"url"}`, the page that
   changes or cancels the subscription and lists its invoices. `409` when
-  the group has never subscribed.
+  the group has no customer at the provider: it never subscribed, or the
+  provider deleted the customer's data.
 - On a server that doesn't charge, both answer `404`.
 
 **Codes.** Whoever runs the server can hand out codes that make syncing
@@ -662,8 +763,13 @@ free for a while, such as a year for someone who contributed.
   `O`, `I` and `L` read as `0`, `1` and `1`.
 - Each code works once, for any group. Its days start when the group's
   trial, paid period or earlier free period ends, whichever is last, so none
-  of them is cut short. A group that keeps a subscription keeps paying for
-  it.
+  of them is cut short. If the group has a subscription that renews,
+  redeeming a code stops it from renewing: it ends with the period that is
+  paid, and the free period follows. A period whose payment failed
+  (`past_due`) isn't paid: the subscription ends at once, so the payment
+  stops being retried, and the free period starts now. The redemption
+  counts even while the provider can't be reached; the server asks it again
+  until it has done its part.
 - Errors: `404 code_unknown`, `409 code_used`, and `409 code_expired` for a
   code not redeemed in time. On a server that doesn't charge, `404`.
 - The server keeps only a hash of each code, and when it was redeemed. The
@@ -671,20 +777,52 @@ free for a while, such as a year for someone who contributed.
   create`, which prints them.
 
 A `delete_group` operation (§5.3) also ends the group's open checkout and
-cancels its subscription, then forgets the group's billing state: nothing
-links a deleted group to the provider's customer any more. Billing requests
-for a deleted group answer `410`, like every other request.
+cancels every subscription of the group to syncing that isn't over: the one
+recorded first, then any other the provider's search finds. The server
+records this in the same transaction as the operation, and tries again
+until the provider has done all of it; only then does it forget the group's
+billing state, so nothing links a deleted group to the provider's customer
+any more. A checkout opened while the group is deleted answers `410` and
+ends too. Billing requests for a deleted group answer `410`, like every
+other request. A group erased for being unused is first checked with the
+provider, in case a payment's event was lost, its search included: one it
+lost track of that is still paid for keeps the group. Otherwise its
+subscriptions end the same way before it goes.
 
 **Provider (informative).** The reference server sells through Stripe
 Managed Payments, with Stripe as merchant of record: Stripe collects the
 payment and handles sales tax and VAT. Stripe sends its events to
-`POST /v1/billing/stripe`, signed in the `Stripe-Signature` header; the server
-refuses signatures that don't match or that are over 5 minutes old. It acts
-on `checkout.session.completed` and `customer.subscription.*` events, and
-reads each subscription back from Stripe instead of trusting the event, so
-events may arrive in any order. Only subscriptions whose metadata names the
-group count for it. Only the server's own checkouts set that metadata, so
-no other payment counts as one for syncing.
+`POST /v1/billing/stripe`, signed in the `Stripe-Signature` header; the
+server refuses signatures that don't match or that are over 5 minutes old.
+It acts on `checkout.session.completed` and `customer.subscription.*` events
+with a snapshot payload, and reads each subscription back from Stripe
+instead of trusting the event, so events may arrive in any order. A
+subscription recorded as `canceled` or `incomplete_expired` stays so, as
+Stripe never moves one out of those: a read that started earlier, or a
+search that lags, can't bring it back. It accepts other events, and thin
+ones, so Stripe stops sending them, and logs them as errors. Only
+subscriptions whose metadata names the group, under the key
+`flectar_mail_sync_group`, count for it, and only while they sell the plans'
+product: one of the plans' prices, or another price of that product. The
+server learns the product by reading the plans' prices; until it could, a
+subscription with another price stays as recorded and its event is refused,
+so Stripe sends it again. Only the server's own checkouts set that metadata,
+so no other payment counts as one for syncing. Before it opens a checkout,
+the server also searches the provider for the group's subscriptions, so one
+it lost track of, or one still waiting for its first payment, isn't paid for
+twice. Nor does anything of the other mode, live or test, than the server's
+key: the server records the mode of each subscription and checkout, and
+ignores events and objects of the other one. When what it stored of a group
+looks out of date, such as a subscription past its period's end, one past
+due for longer than uploads wait for, one still waiting for its first
+payment, or a checkout with nothing to show for it, the server reads it back
+from the provider before answering, at most every five minutes per group, or
+every 30 s while its checkout is still open: the provider stops resending a
+lost event after three days. A read-back that changed what the group pays
+sends its devices a `billing` event. A checkout whose subscription is
+recorded is forgotten, so a group whose subscription ended isn't read back
+again. Reads of one subscription are recorded one at a time, so an older
+read never lands after a newer one.
 
 ### 6.15 Files
 
@@ -696,18 +834,30 @@ stores none and answers these routes with 404.
   length, makes room for it and answers `{"id": "...", "upload": {"url",
   "method": "PUT", "expiresAt"}}`. Room counts against the group's file quota
   at once (507 `quota_exceeded`), larger files are refused (413), and on a
-  server that charges, a group that may not upload gets 402.
+  server that charges, a group that may not upload gets 402. Every address
+  handed out costs requests that object storage charges for, so a group
+  makes room for 20 files at once, then one a minute (§6.13).
 - The device sends the sealed bytes with the method to the URL, which works
-  without a session until `expiresAt`. It may be the server's own
-  (`/v1/file-data/{token}`) or object storage's, such as a presigned S3
-  address.
+  without a session until `expiresAt`, 2 minutes on, and takes exactly the
+  announced size. It may be the server's own (`/v1/file-data/{token}`) or
+  object storage's, such as a presigned S3 address that signs the
+  `Content-Length`. A device whose upload fails deletes the file, which
+  gives its room back once the address expires.
 - `POST /v1/groups/{group}/files/{id}/complete` confirms the upload once its
   length matches the announced size (409 otherwise). Unconfirmed room is
   dropped after an hour.
 - `GET /v1/groups/{group}/files/{id}` answers `{"size": n, "download":
-  {"url", "method": "GET", "expiresAt"}}` for a confirmed file.
-- `DELETE /v1/groups/{group}/files/{id}` removes it. A file also goes
-  `ttlSeconds` after its upload, or when its group is deleted.
+  {"url", "method": "GET", "expiresAt"}}` for a confirmed file. A download
+  address works for 5 minutes. A file whose stored bytes no longer have
+  its size is removed instead, and answers `404`.
+- `DELETE /v1/groups/{group}/files/{id}` removes it. Its upload address may
+  still work until it expires, and an upload that started through it may
+  take 10 minutes more, so the file counts against the group's quota until
+  then, and whatever arrives through it is removed. A file also goes
+  `ttlSeconds` after its upload is confirmed, or when its group is deleted.
+- A group keeps at most 1000 files by default, and one that doesn't pay 20,
+  counting those not uploaded yet and deleted ones whose upload address
+  still works; past that, room for another answers `507 quota_exceeded`.
 
 Devices check a downloaded file against the size in the record before
 opening it.
@@ -764,12 +914,23 @@ opening it.
   seen, even after a deletion. It is the base of three-way merges.
 - an outbox: local changes not yet committed, each stamped when made
 
+**Logging in** (§6.4): on `challenge_expired`, the device logs in again
+with a new challenge, a few times, then tries again later. On
+`device_unknown`, the server may have lost the group, so the device creates
+it again from its genesis (step 6). If it exists (`409`), the server lost at
+most the operation that added this device, which another device appends
+again: the device keeps everything and tries again later. Only
+`device_removed` and `group_deleted` are final, and only then does a device
+leave the group and drop its keys.
+
 One sync cycle:
 
 1. **Chain:** read operations from the device's last one, which the server
    must still hold, and verify them (§5.4). A different operation there is a
    fork, and the device stops. If a rotation is due (§7), rotate.
-2. **Pull:** read `changes` from the cursor until `more` is false.
+2. **Pull:** read `changes` from the cursor until `more` is false. A page
+   of changes or operations that says more follow and brings nothing new
+   is an error, so a faulty server can't keep a device asking forever.
    - Decrypt each record and merge it into local state against the mirror.
    - A version whose stamp is older than the mirror's newest was rolled back
      by the server. The device refuses it and commits its own version again,
@@ -777,10 +938,17 @@ One sync cycle:
    - A record that does not decrypt or parse is skipped and reported, so
      one bad record cannot stop sync.
 3. **Push:** commit the outbox with `expectedSeq` taken from the mirror.
-   - `409 conflict`: pull again, merge, and retry.
+   A record larger than `maxRecordBytes` stays in the outbox, reported,
+   and the rest goes.
+   - `409 conflict`: pull again, merge, and retry. A conflicting version the
+     pull could not read is written over: the change is committed again on
+     the `seq` the conflict named.
    - `409 stale_epoch`: read the chain, fetch the new root key, seal again.
-   - `402 payment_required`: stop pushing. What was pulled stays applied,
-     and the outbox waits until the group pays (§6.14).
+   - `402 payment_required`: commit only the outbox's deletions, which the
+     group may still make, then stop. What was pulled stays applied, and the
+     other changes wait until the group pays (§6.14).
+   - `507 quota_exceeded`, `507 server_full` or `413 payload_too_large`:
+     stop pushing, and report it. What was pulled stays applied.
 4. **`410 gone`:** read the whole group from `since=0`, then forget mirrored
    records that are not in it. Their deletions expired.
 5. **Rollback:** a server `highSeq` below the seen mark means the server lost
@@ -790,9 +958,14 @@ One sync cycle:
    - Take the server's `highSeq` as the new seen mark.
 6. **Lost chain:** if the server's chain is a prefix of the device's, the
    device appends the missing operations again, with the wraps each one
-   needs. If the server lost the whole group, so that the device's login
-   fails, the device creates the group again from its genesis. A server can
-   therefore be rebuilt from any device that remains a member.
+   needs. Appending takes a session, so a device added in the lost part,
+   which the server doesn't know, waits (`device_unknown`) until one it
+   knows does it. If the server lost the whole group, so that logins answer
+   `device_unknown`, the device creates the group again from its genesis;
+   the rest of the chain then waits for the group's first device, the only
+   one the genesis names. A server restored from a backup can therefore be
+   repaired by any member it still knows, and one that lost everything only
+   while the group's first device remains a member.
 7. **When:** sync at start and on foreground, about 2 s after a local
    change, on each `seq` or `chain` event, and periodically while running.
 
@@ -805,11 +978,13 @@ the ones clients must respect.
 |---|---|
 | Record ciphertext | 256 KiB |
 | Records per commit | 1000 |
-| Request body | 8 MiB |
-| Stored bytes per group | 64 MiB |
-| Records or operations per page | 1000 |
+| Request body | 8 MiB for a commit, 256 KiB for other requests with a session, 64 KiB for those without but the payment provider's events (256 KiB) and uploads to a server's own file addresses (the file's size) |
+| Stored bytes per group | 64 MiB, each record, tombstone and operation counting 256 bytes more; 8 MiB for a group that doesn't pay (§6.14) |
+| Records or operations per page | 1000; a page of records also ends near 2 MiB |
 | Devices per group | 25 |
-| Open pairing slots per server | 1024 |
+| Operations per chain | 1000, then only those of §6.10 |
+| Open pairing slots per server | 4096; 8 per client address |
+| Pending login challenges | 100000; 64 per client address |
 | Pairing slot lifetime | 10 min |
 | Messages per pairing slot | 4 |
 | Pairing message | 4096 bytes |
@@ -818,7 +993,8 @@ the ones clients must respect.
 | Session lifetime | 1 h |
 | Tombstone retention | 180 days |
 | Sealed file | 26 MiB |
-| File bytes per group | 512 MiB |
+| File bytes per group | 512 MiB; 32 MiB for a group that doesn't pay |
+| Files per group | 1000; 20 for a group that doesn't pay |
 | File lifetime | 60 days |
 | Unused group lifetime | 2 years without a sign-in |
 
@@ -859,6 +1035,14 @@ the ones clients must respect.
 - **Logins:** login signatures are bound to the server URL and to a
   single-use nonce. Session tokens are random and stored only as SHA-256
   hashes.
+- **What a refused login reveals:** a challenge request already names a
+  group and a device, and is answered the same way whether they exist.
+  `device_unknown` doesn't say whether the group, the device or the
+  signature was wrong. Only the holder of a removed device's key learns
+  that it was removed. Whoever knows a group's id learns whether it was
+  deleted. Group and device ids are random; the group's devices and the
+  server know them, and a paying group's id also reaches the payment
+  provider (§6.14).
 - **Removed devices:** a removed device keeps what it already saw. After
   `rotate`, it cannot read anything new.
 - **Pairing:**

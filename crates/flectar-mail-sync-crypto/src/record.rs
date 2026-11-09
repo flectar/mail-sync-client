@@ -8,6 +8,10 @@ use sha2::Sha256;
 /// learns only a coarse size.
 pub const PAD_BLOCK: usize = 256;
 
+/// The shortest ciphertext [`seal_record`] makes: one padded block and the
+/// Poly1305 tag. Servers refuse shorter ones.
+pub const MIN_RECORD_CIPHERTEXT_BYTES: usize = PAD_BLOCK + 16;
+
 /// Pad with 0x80 followed by zeros (ISO/IEC 7816-4) up to a multiple of
 /// [`PAD_BLOCK`]. Always adds at least one byte.
 pub fn pad(plaintext: &[u8]) -> Vec<u8> {
@@ -173,6 +177,8 @@ mod tests {
             b"{\"theme\":\"dark\"}"
         );
         assert_eq!(sealed.len(), 256 + 16, "padded block plus the Poly1305 tag");
+        let (_, empty) = seal_record(&key, &group, &record, &tag, 1, b"").unwrap();
+        assert_eq!(empty.len(), MIN_RECORD_CIPHERTEXT_BYTES);
         for (g, r, t, e) in [
             ([9u8; 16], record, tag, 1),
             (group, [9u8; 16], tag, 1),

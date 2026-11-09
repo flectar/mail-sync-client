@@ -124,7 +124,9 @@ impl GroupState {
     }
 
     /// Verify the next operation and apply it. On error the state is
-    /// unchanged.
+    /// unchanged: every check runs before anything changes, so the state is
+    /// updated in place rather than copied for each operation, and
+    /// replaying a long chain stays linear.
     pub fn apply(&mut self, op_bytes: &[u8], signatures: &[&[u8]]) -> Result<Op> {
         if self.deleted {
             return Err(Error::Malformed("the group was deleted"));
@@ -144,22 +146,13 @@ impl GroupState {
             return Err(Error::Malformed("the operation carries one signature"));
         };
         verify_op(op_bytes, &self.authorizer_key(authorizer)?, signature)?;
+        self.check(&op.kind)?;
 
-        let mut next = self.clone();
         match &op.kind {
             OpKind::Genesis(_) => unreachable!("rejected above: no authorizer"),
             OpKind::AddDevice(add) => {
-                let id = add.device.device_id;
-                if id == RECOVERY_ID || next.devices.contains_key(&id) || next.removed.contains(&id)
-                {
-                    return Err(Error::Malformed("the device id is taken"));
-                }
-                SignPublicKey::from_bytes(&add.device.sign_public_key)?.verify(
-                    &device_binding_message(&self.group_id, &add.device)?,
-                    &add.binding_signature,
-                )?;
-                next.devices.insert(
-                    id,
+                self.devices.insert(
+                    add.device.device_id,
                     Member {
                         sign_public_key: add.device.sign_public_key,
                         kem_public_key: add.device.kem_public_key.clone(),
@@ -167,24 +160,61 @@ impl GroupState {
                 );
             }
             OpKind::RemoveDevice(remove) => {
-                if next.devices.remove(&remove.device_id).is_none() {
-                    return Err(Error::Malformed("the device is not in the group"));
-                }
-                next.removed.insert(remove.device_id);
-                next.rotation_due = true;
+                self.devices.remove(&remove.device_id);
+                self.removed.insert(remove.device_id);
+                self.rotation_due = true;
             }
             OpKind::Rotate(rotate) => {
-                if rotate.epoch != next.epoch + 1 {
+                self.epoch = rotate.epoch;
+                self.root_commitment = rotate.root_commitment;
+                self.sealed_previous_roots
+                    .insert(rotate.epoch, rotate.sealed_previous_root.clone());
+                self.rotation_due = false;
+            }
+            OpKind::ResetRecovery(reset) => {
+                self.recovery_sign_public_key = reset.recovery_sign_public_key;
+                self.recovery_kem_public_key = reset.recovery_kem_public_key.clone();
+                self.rotation_due = true;
+            }
+            OpKind::MoveServer(moved) => self.server_url = Some(moved.url.clone()),
+            OpKind::DeleteGroup(_) => self.deleted = true,
+        }
+        self.head_index = op.index;
+        self.head_hash = op_hash(op_bytes);
+        Ok(op)
+    }
+
+    /// The rules of one kind of operation (SPEC §5.4) against the current
+    /// state. Changes nothing.
+    fn check(&self, kind: &OpKind) -> Result<()> {
+        match kind {
+            OpKind::Genesis(_) => Err(Error::Malformed("a chain has only one genesis")),
+            OpKind::AddDevice(add) => {
+                let id = add.device.device_id;
+                if id == RECOVERY_ID || self.devices.contains_key(&id) || self.removed.contains(&id)
+                {
+                    return Err(Error::Malformed("the device id is taken"));
+                }
+                SignPublicKey::from_bytes(&add.device.sign_public_key)?.verify(
+                    &device_binding_message(&self.group_id, &add.device)?,
+                    &add.binding_signature,
+                )
+            }
+            OpKind::RemoveDevice(remove) => {
+                if self.devices.contains_key(&remove.device_id) {
+                    Ok(())
+                } else {
+                    Err(Error::Malformed("the device is not in the group"))
+                }
+            }
+            OpKind::Rotate(rotate) => {
+                if rotate.epoch != self.epoch + 1 {
                     return Err(Error::Malformed("a rotation starts the next epoch"));
                 }
                 if rotate.sealed_previous_root.is_empty() {
                     return Err(Error::Malformed("a rotation carries the previous root key"));
                 }
-                next.epoch = rotate.epoch;
-                next.root_commitment = rotate.root_commitment;
-                next.sealed_previous_roots
-                    .insert(rotate.epoch, rotate.sealed_previous_root.clone());
-                next.rotation_due = false;
+                Ok(())
             }
             OpKind::ResetRecovery(reset) => {
                 SignPublicKey::from_bytes(&reset.recovery_sign_public_key)?.verify(
@@ -194,24 +224,18 @@ impl GroupState {
                         &reset.recovery_kem_public_key,
                     )?,
                     &reset.binding_signature,
-                )?;
-                next.recovery_sign_public_key = reset.recovery_sign_public_key;
-                next.recovery_kem_public_key = reset.recovery_kem_public_key.clone();
-                next.rotation_due = true;
+                )
             }
             OpKind::MoveServer(moved) => {
                 let url = moved.url.as_str();
-                if !(url.starts_with("https://") || url.starts_with("http://")) {
-                    return Err(Error::Malformed("the server URL must be http(s)"));
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    Ok(())
+                } else {
+                    Err(Error::Malformed("the server URL must be http(s)"))
                 }
-                next.server_url = Some(moved.url.clone());
             }
-            OpKind::DeleteGroup(_) => next.deleted = true,
+            OpKind::DeleteGroup(_) => Ok(()),
         }
-        next.head_index = op.index;
-        next.head_hash = op_hash(op_bytes);
-        *self = next;
-        Ok(op)
     }
 }
 
@@ -592,6 +616,92 @@ mod tests {
         });
         assert!(chain.push(&laptop, skip_epoch).is_err());
         chain.push(&laptop, kind).unwrap();
+    }
+
+    #[test]
+    fn every_refused_operation_leaves_the_state_alone() {
+        let recovery = RecoveryCode::from_bytes([3; 32]).signing_key();
+        let (laptop, laptop_keys) = device(10);
+        let (phone, phone_keys) = device(20);
+        let mut chain = start(&recovery, &laptop, laptop_keys.clone());
+        let kind = add(
+            &chain,
+            Authorizer::Device([10; 16]),
+            &phone,
+            phone_keys.clone(),
+        );
+        chain.push(&laptop, kind).unwrap();
+        chain
+            .push(
+                &laptop,
+                OpKind::RemoveDevice(RemoveDevice {
+                    authorizer: Authorizer::Device([10; 16]),
+                    device_id: [20; 16],
+                }),
+            )
+            .unwrap();
+        let before = chain.state.clone();
+
+        let wanted = RecoveryCode::from_bytes([4; 32]).signing_key();
+        let OpKind::ResetRecovery(mut forged_reset) =
+            reset(&chain, Authorizer::Device([10; 16]), &wanted)
+        else {
+            unreachable!()
+        };
+        forged_reset.binding_signature = [0; 64];
+        let (stranger, stranger_keys) = device(30);
+        let mut unbound = add(
+            &chain,
+            Authorizer::Device([10; 16]),
+            &stranger,
+            stranger_keys,
+        );
+        if let OpKind::AddDevice(add) = &mut unbound {
+            add.binding_signature = [0; 64];
+        }
+        let refused = [
+            // A removed id never comes back, nor does a member's id repeat.
+            add(&chain, Authorizer::Device([10; 16]), &phone, phone_keys),
+            add(&chain, Authorizer::Device([10; 16]), &laptop, laptop_keys),
+            unbound,
+            OpKind::RemoveDevice(RemoveDevice {
+                authorizer: Authorizer::Device([10; 16]),
+                device_id: [20; 16],
+            }),
+            OpKind::Rotate(Rotate {
+                authorizer: Authorizer::Device([10; 16]),
+                epoch: 3,
+                root_commitment: [8; 32],
+                sealed_previous_root: vec![1; 72],
+            }),
+            OpKind::Rotate(Rotate {
+                authorizer: Authorizer::Device([10; 16]),
+                epoch: 2,
+                root_commitment: [8; 32],
+                sealed_previous_root: vec![],
+            }),
+            OpKind::ResetRecovery(forged_reset),
+            OpKind::MoveServer(MoveServer {
+                authorizer: Authorizer::Device([10; 16]),
+                url: "ftp://elsewhere.example".into(),
+            }),
+        ];
+        for kind in refused {
+            assert!(chain.push(&laptop, kind.clone()).is_err(), "{kind:?}");
+            assert_eq!(chain.state, before, "{kind:?} changed the state");
+        }
+        // A signer that may not act changes nothing either.
+        assert!(
+            chain
+                .push(
+                    &phone,
+                    OpKind::DeleteGroup(DeleteGroup {
+                        authorizer: Authorizer::Device([20; 16]),
+                    }),
+                )
+                .is_err()
+        );
+        assert_eq!(chain.state, before);
     }
 
     #[test]

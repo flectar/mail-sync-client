@@ -549,6 +549,18 @@ pub struct ChainEvent {
 pub enum ErrorCode {
     BadRequest,
     Unauthorized,
+    /// A login's challenge expired, was used, or the server no longer
+    /// holds it, for example after a restart: ask for a new one.
+    ChallengeExpired,
+    /// The server could not confirm the login: it doesn't know the group or
+    /// the device, or the signature didn't check against the device's key,
+    /// as when the server's address changed. Not a removal: the server may
+    /// have lost recent changes that another device puts back. Keep the
+    /// device's state, create the group again from its genesis if the
+    /// server lost it, and try again later.
+    DeviceUnknown,
+    /// The login was signed by the key of a device the chain removed.
+    DeviceRemoved,
     Forbidden,
     NotFound,
     Conflict,
@@ -562,9 +574,20 @@ pub enum ErrorCode {
     StaleEpoch,
     PayloadTooLarge,
     QuotaExceeded,
+    /// The server is short of disk space for now: new groups and uploads
+    /// wait, everything else goes on. Try again later.
+    ServerFull,
+    /// The group's chain holds as many operations as the server keeps. It
+    /// still takes removing a device, the rotation that follows, and
+    /// deleting the group; to add devices again, start a new group.
+    ChainFull,
     /// The group's free trial or paid period ended: uploads resume once it
     /// is paid. Reading, removing devices and deleting still work.
     PaymentRequired,
+    /// A checkout was refused because the group already has a
+    /// subscription, perhaps one whose payment is still pending: open the
+    /// page that manages it instead.
+    AlreadySubscribed,
     /// No such code: it was mistyped, or never made.
     CodeUnknown,
     /// The code was redeemed already. Each code works once.
@@ -572,6 +595,9 @@ pub enum ErrorCode {
     /// The code was not redeemed in time.
     CodeExpired,
     RateLimited,
+    /// The request, or its body, took longer than the server waits: try
+    /// again.
+    RequestTimeout,
     Internal,
     /// A code this version does not know, from a newer server.
     #[serde(other)]
@@ -802,6 +828,26 @@ mod tests {
             serde_json::to_value(&delete).unwrap(),
             serde_json::json!({"recordId": "AAAAAAAAAAAAAAAAAAAAAA", "expectedSeq": 7, "deleted": true})
         );
+    }
+
+    #[test]
+    fn newer_error_codes_have_their_names() {
+        let codes = [
+            (ErrorCode::ChainFull, "chain_full"),
+            (ErrorCode::ServerFull, "server_full"),
+            (ErrorCode::AlreadySubscribed, "already_subscribed"),
+            (ErrorCode::ChallengeExpired, "challenge_expired"),
+            (ErrorCode::DeviceUnknown, "device_unknown"),
+            (ErrorCode::DeviceRemoved, "device_removed"),
+            (ErrorCode::RequestTimeout, "request_timeout"),
+        ];
+        for (code, name) in codes {
+            assert_eq!(serde_json::to_value(code).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ErrorCode>(name.into()).unwrap(),
+                code
+            );
+        }
     }
 
     #[test]

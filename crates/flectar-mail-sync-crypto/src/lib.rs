@@ -36,7 +36,9 @@ pub use pairing::{
     INVITE_INDEX, Invite, JOIN_REQUEST_INDEX, JOIN_RESULT_INDEX, JoinRequest, JoinResult,
     PairingSecret, approval_words,
 };
-pub use record::{collection_tag, open_record, pad, seal_record, unpad};
+pub use record::{
+    MIN_RECORD_CIPHERTEXT_BYTES, collection_tag, open_record, pad, seal_record, unpad,
+};
 pub use recovery::RecoveryCode;
 
 /// Domain-separation labels. Each key and signature is bound to exactly one

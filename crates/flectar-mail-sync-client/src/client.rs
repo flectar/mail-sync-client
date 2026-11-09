@@ -25,6 +25,9 @@ use zeroize::Zeroizing;
 /// How often an operation is rebuilt when other devices keep moving the
 /// chain.
 const APPEND_ATTEMPTS: usize = 5;
+/// Logins tried when the server lost the challenge in between, as when it
+/// restarts.
+const LOGIN_ATTEMPTS: usize = 3;
 /// Sessions are renewed this long before they expire.
 const SESSION_MARGIN_MS: i64 = 60_000;
 const SECRETS_VERSION: u8 = 1;
@@ -197,7 +200,41 @@ impl Verified {
     }
 }
 
-/// Log in as `identity`'s device.
+/// Log in with a challenge for `request`, signing its nonce with `sign`. A
+/// challenge the server lost before the answer, as when it restarts, is
+/// asked for again a few times; past that, its `challenge_expired` error
+/// is returned, which is worth trying again later.
+async fn login_with(
+    http: &Http,
+    request: &ChallengeRequest,
+    sign: impl Fn(&[u8; 32]) -> Result<[u8; 64]>,
+) -> Result<Session> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let challenge = http.challenge(request).await?;
+        let nonce = challenge
+            .nonce
+            .to_array()
+            .ok_or_else(|| Error::Malformed("challenge nonce".into()))?;
+        let signature = sign(&nonce)?;
+        match http
+            .session(&SessionRequest {
+                challenge_id: challenge.challenge_id,
+                signature: Bytes::from(signature),
+            })
+            .await
+        {
+            Err(error)
+                if error.code() == Some(ErrorCode::ChallengeExpired)
+                    && attempts < LOGIN_ATTEMPTS => {}
+            answer => return answer,
+        }
+    }
+}
+
+/// Log in as `identity`'s device. Only [`Error::Removed`] and
+/// [`Error::GroupDeleted`] are final; [`Error::LoginRefused`] is not.
 async fn device_login(
     http: &Http,
     identity: &DeviceIdentity,
@@ -205,28 +242,30 @@ async fn device_login(
 ) -> Result<Session> {
     let group_id = identity.group_id();
     let device_id = identity.device_id();
-    let challenge = http
-        .challenge(&ChallengeRequest {
-            group_id: Some(Bytes::from(group_id)),
-            device_id: Some(Bytes::from(device_id)),
-            recovery_public_key: None,
-        })
-        .await?;
-    let nonce = challenge
-        .nonce
-        .to_array()
-        .ok_or_else(|| Error::Malformed("challenge nonce".into()))?;
-    let signature = sign_auth(signing, http.server_url(), &group_id, &device_id, &nonce)?;
-    match http
-        .session(&SessionRequest {
-            challenge_id: challenge.challenge_id,
-            signature: Bytes::from(signature),
-        })
-        .await
-    {
-        Err(error) if error.status() == Some(401) => Err(Error::LoginRefused),
-        other => other,
-    }
+    let request = ChallengeRequest {
+        group_id: Some(Bytes::from(group_id)),
+        device_id: Some(Bytes::from(device_id)),
+        recovery_public_key: None,
+    };
+    login_with(http, &request, |nonce| {
+        Ok(sign_auth(
+            signing,
+            http.server_url(),
+            &group_id,
+            &device_id,
+            nonce,
+        )?)
+    })
+    .await
+    .map_err(|error| match error.code() {
+        Some(ErrorCode::DeviceRemoved) => Error::Removed,
+        Some(ErrorCode::GroupDeleted) => Error::GroupDeleted,
+        Some(ErrorCode::ChallengeExpired) => error,
+        // `device_unknown`, or any refusal of a server from before the
+        // codes: never taken for a removal.
+        _ if error.status() == Some(401) => Error::LoginRefused,
+        _ => error,
+    })
 }
 
 /// The whole chain, page by page.
@@ -234,6 +273,9 @@ async fn fetch_chain(http: &Http, token: &str, group_id: &[u8; 16]) -> Result<Ve
     let mut ops = Vec::new();
     loop {
         let page = http.ops(token, group_id, ops.len() as u64).await?;
+        if page.more && page.ops.is_empty() {
+            return Err(stalled_page());
+        }
         ops.extend(page.ops.into_iter().map(|op| {
             ChainOp {
                 op: op.op.0,
@@ -248,6 +290,12 @@ async fn fetch_chain(http: &Http, token: &str, group_id: &[u8; 16]) -> Result<Ve
             return Ok(ops);
         }
     }
+}
+
+/// A page that says more follow, and brings nothing new: a server that
+/// keeps answering so would be asked forever.
+pub(crate) fn stalled_page() -> Error {
+    Error::Malformed("a page that says more follow, and brings nothing new".into())
 }
 
 /// A device's connection to its group.
@@ -400,11 +448,18 @@ impl SyncClient {
     /// The payment provider's page where the group subscribes to `plan`, a
     /// [`Plan::id`](flectar_mail_sync_proto::Plan::id), for the app to open
     /// in the browser.
+    ///
+    /// [`Error::AlreadySubscribed`] when the group has a subscription
+    /// already: open [`SyncClient::manage_billing`] instead.
     pub async fn checkout(&self, plan: &str) -> Result<String> {
         let group_id = self.identity.group_id();
         let link = self
             .authed(|token| async move { self.http.checkout(&token, &group_id, plan).await })
-            .await?;
+            .await
+            .map_err(|error| match error.code() {
+                Some(ErrorCode::AlreadySubscribed) => Error::AlreadySubscribed,
+                _ => error,
+            })?;
         Ok(link.url)
     }
 
@@ -443,7 +498,14 @@ impl SyncClient {
             .id
             .to_array()
             .ok_or_else(|| Error::Malformed("file id".into()))?;
-        self.http.upload(&created.upload, sealed).await?;
+        if let Err(error) = self.http.upload(&created.upload, sealed).await {
+            // Its room would count against the group's file quota for an
+            // hour.
+            if let Err(cleanup) = self.delete_file(&id).await {
+                tracing::debug!(error = %cleanup, "could not give back a failed upload's room");
+            }
+            return Err(error);
+        }
         self.authed(|token| async move { self.http.complete_file(&token, &group_id, &id).await })
             .await?;
         Ok(FileRef { id, key, size })
@@ -516,8 +578,8 @@ impl SyncClient {
                 .await
             {
                 Err(Error::LoginRefused) => {
-                    // Our device is unknown: the server may have lost the
-                    // group. Creating it again fails if it exists.
+                    // The server doesn't know our device: it may have lost
+                    // the group. Creating it again fails if it exists.
                     self.restore_group(chain).await?;
                     return self.restore_ops(chain).await;
                 }
@@ -554,7 +616,11 @@ impl SyncClient {
             if !page.more {
                 return Ok(());
             }
-            since = chain.ops.len() as u64;
+            let next = chain.ops.len() as u64;
+            if next <= since {
+                return Err(stalled_page());
+            }
+            since = next;
         }
     }
 
@@ -620,7 +686,9 @@ impl SyncClient {
                 tracing::warn!("the sync server had lost the group; created it again");
                 Ok(())
             }
-            // It exists, so this device is no longer in it.
+            // It exists, so the server lost at most the operation that added
+            // this device, which a device it kept appends again. Not a
+            // removal: the server says that only as `device_removed`.
             Err(error) if error.status() == Some(409) => Err(Error::LoginRefused),
             Err(error) => Err(error),
         }
@@ -629,13 +697,22 @@ impl SyncClient {
     /// Append again the operations the server lost.
     async fn restore_ops(&self, chain: &mut Verified) -> Result<()> {
         let group_id = self.identity.group_id();
-        let server = self
-            .authed(|token| async move { self.http.ops(&token, &group_id, 0).await })
-            .await?;
-        if server.more {
-            return Err(Error::Untrusted("the server's chain does not match"));
+        let mut server = Vec::new();
+        loop {
+            let since = server.len() as u64;
+            let page = self
+                .authed(|token| async move { self.http.ops(&token, &group_id, since).await })
+                .await?;
+            if page.more && page.ops.is_empty() {
+                return Err(stalled_page());
+            }
+            server.extend(page.ops);
+            // A chain longer than ours can't be a prefix of it.
+            if !page.more || server.len() > chain.ops.len() {
+                break;
+            }
         }
-        for (index, op) in server.ops.iter().enumerate() {
+        for (index, op) in server.iter().enumerate() {
             if op.index != index as u64
                 || chain.hashes.get(index) != Some(&op_hash(op.op.as_slice()))
             {
@@ -645,10 +722,10 @@ impl SyncClient {
             }
         }
         tracing::warn!(
-            lost = chain.ops.len() - server.ops.len(),
+            lost = chain.ops.len() - server.len(),
             "the sync server had lost chain operations; appending them again"
         );
-        for index in server.ops.len()..chain.ops.len() {
+        for index in server.len()..chain.ops.len() {
             let request = AppendOp {
                 op: Bytes(chain.ops[index].op.clone()),
                 signatures: chain.ops[index]
@@ -1114,34 +1191,26 @@ impl SyncClient {
         let recovery_kem = KemSecretKey::derive(&code.kem_seed());
         let api = Http::new(http.clone(), server_url);
 
-        let challenge = api
-            .challenge(&ChallengeRequest {
-                group_id: None,
-                device_id: None,
-                recovery_public_key: Some(Bytes::from(recovery.public_key().to_bytes())),
-            })
-            .await?;
-        let nonce = challenge
-            .nonce
-            .to_array()
-            .ok_or_else(|| Error::Malformed("challenge nonce".into()))?;
-        let signature = sign_auth(
-            &recovery,
-            api.server_url(),
-            &RECOVERY_ID,
-            &RECOVERY_ID,
-            &nonce,
-        )?;
-        let session = match api
-            .session(&SessionRequest {
-                challenge_id: challenge.challenge_id,
-                signature: Bytes::from(signature),
-            })
-            .await
-        {
-            Err(error) if error.status() == Some(401) => return Err(Error::UnknownRecoveryCode),
-            other => other?,
+        let request = ChallengeRequest {
+            group_id: None,
+            device_id: None,
+            recovery_public_key: Some(Bytes::from(recovery.public_key().to_bytes())),
         };
+        let session = login_with(&api, &request, |nonce| {
+            Ok(sign_auth(
+                &recovery,
+                api.server_url(),
+                &RECOVERY_ID,
+                &RECOVERY_ID,
+                nonce,
+            )?)
+        })
+        .await
+        .map_err(|error| match error.code() {
+            Some(ErrorCode::ChallengeExpired) => error,
+            _ if error.status() == Some(401) => Error::UnknownRecoveryCode,
+            _ => error,
+        })?;
         let group_id: [u8; 16] = session
             .group_id
             .to_array()
